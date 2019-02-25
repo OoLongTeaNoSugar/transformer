@@ -1,0 +1,109 @@
+#-*- ecoding:utf-8 -*-
+
+import torch
+import torch.nn as nn
+import torch.functional as F
+import numpy as np
+import pandas as pd
+
+class ScaledDotProductionAttention(nn.Module):
+    '''scaled_dot_production_attention缩放因子dk'''
+    def __init__(self, attention_dropout=0.0):
+        super(ScaledDotProductionAttention,self).__init__()
+        self.dropout = nn.Dropout(attention_dropout)
+        self.softmax = nn.Softmax(dim=2)
+
+    def forward(self, q, k, v, scale=None, atten_mask=None):
+        """
+        前向传播，
+        :param q: query张量，形状[B, L_q, D_q]
+        :param k: keys张量，[B, L_k, D_k]
+        :param v: values张量,[B, L_v, D_v],一般就是k
+        :param scale: 缩放因子，float
+        :param atten_mask: masking张量，[B,L_q,L_k]
+        :return:上下文的attention
+        """
+        attention = torch.bmm(q,k.transpose(1,2))
+        if scale:
+            attention = attention*scale
+        if atten_mask:
+            attention = attention.masked_fill_(atten_mask, -np.inf)
+
+        #softmax
+        attention = self.softmax(attention)
+        attention = self.dropout(attention)
+
+        #点积
+        context = torch.bmm(attention, v)
+
+        return context
+
+
+
+class MultiHeadAttention(nn.Module):
+
+    def __init__(self, model_dim=512, num_head=8, dropout=0.0):
+        super(MultiHeadAttention,self).__init__()
+
+        self.dim_per_head = model_dim // num_head
+        self.num_head = num_head
+        self.linear_k = nn.Linear(model_dim, self.dim_per_head*num_head)
+        self.linear_q = nn.Linear(model_dim, self.dim_per_head*num_head)
+        self.linear_v = nn.Linear(model_dim, self.dim_per_head*num_head)
+
+        self.dot_product_attention = ScaledDotProductionAttention(dropout)
+        self.linear_final = nn.Linear(model_dim,model_dim)
+        self.dropout = nn.Dropout(dropout)
+
+        self.layer_norm = nn.LayerNorm(model_dim)
+
+    def forward(self, k, v, q, atten_mask=None):
+        """
+
+        :param q:
+        :param k:
+        :param v:
+        :param atten_mask:
+        :return:
+        """
+        # 残差连接
+        residual = q
+        dim_per_head = self.dim_per_head
+        num_head = self.num_head
+        batch_size = k.size(0)
+
+        # linear
+        k = self.linear_k(k)
+        v = self.linear_v(v)
+        q = self.linear_q(q)
+
+        # split by heads
+        k = k.view(batch_size*num_head, -1, dim_per_head)
+        v = v.view(batch_size*num_head, -1, dim_per_head)
+        q = q.view(batch_size*num_head, -1, dim_per_head)
+
+        if atten_mask:
+            atten_mask = atten_mask.repeat(num_head, 1, 1)
+
+        # scaled dot product
+        scale = (k.size(-1)) ** -0.5
+        context, attention = self.dot_product_attention(q, k, v, scale, atten_mask)
+
+        # contact
+        context = context.view(batch_size, -1, dim_per_head*num_head)
+
+        # final linear
+        output = self.linear_final(context)
+
+        # dropout
+        output = self.dropout(output)
+
+        # add and norm
+        output = self.layer_norm(residual+output)
+
+        return output, attention
+
+
+
+
+def padding_mask(seq_k, seq_q):
